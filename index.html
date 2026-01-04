@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kotodama 3D Visualizer</title>
+    <style>
+        :root {
+            --glass-bg: rgba(255, 255, 255, 0.08);
+            --glass-border: rgba(255, 255, 255, 0.15);
+            --apple-blur: blur(25px) saturate(180%);
+        }
+
+        body, html {
+            margin: 0; padding: 0; overflow: hidden;
+            background-color: #000;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+            color: white;
+        }
+
+        #canvas-container {
+            position: absolute; top: 0; left: 0;
+            width: 100%; height: 100%; z-index: 0;
+            background: radial-gradient(circle at center, #0a0a0a 0%, #000 100%);
+        }
+
+        #controls-bar {
+            position: absolute; bottom: 40px; left: 50%;
+            transform: translateX(-50%);
+            width: 90%; max-width: 480px; height: 64px; z-index: 10;
+            background: var(--glass-bg);
+            backdrop-filter: var(--apple-blur);
+            -webkit-backdrop-filter: var(--apple-blur);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0 24px;
+            transition: opacity 0.8s cubic-bezier(0.4, 0, 0.2, 1), transform 0.8s ease;
+        }
+
+        .hidden-ui { opacity: 0; pointer-events: none; transform: translate(-50%, 30px); }
+
+        .btn-icon { background: none; border: none; color: white; cursor: pointer; display: flex; align-items: center; }
+        .btn-icon svg { width: 28px; height: 28px; fill: currentColor; }
+        
+        .timeline {
+            flex-grow: 1; margin: 0 20px; position: relative;
+            height: 6px; background: rgba(255,255,255,0.1); border-radius: 10px; cursor: pointer;
+            overflow: hidden;
+        }
+        #progress-fill {
+            position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+            background: #fff; border-radius: 10px; box-shadow: 0 0 15px rgba(255,255,255,0.4);
+            pointer-events: none;
+        }
+
+        #setup-overlay {
+            position: absolute; z-index: 100; width: 100%; height: 100%;
+            display: flex; justify-content: center; align-items: center;
+            background: rgba(0,0,0,0.95); transition: opacity 1s ease;
+        }
+        .card { background: rgba(20, 20, 20, 0.8); padding: 40px; border-radius: 24px; text-align: center; width: 320px; border: 1px solid #333; }
+        #start-btn { background: white; color: black; border: none; width: 100%; padding: 16px; border-radius: 12px; font-weight: 600; cursor: pointer; margin-top: 20px; }
+        #audio-element { display: none; }
+    </style>
+    
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <div id="canvas-container"></div>
+
+    <div id="setup-overlay">
+        <div class="card">
+            <h2 style="letter-spacing: 5px; font-weight: 200;">KOTODAMA</h2>
+            <div style="text-align:left; margin-top:20px;">
+                <input type="file" id="audio-input" accept="audio/*" style="width:100%; margin-bottom:15px;">
+                <input type="file" id="lrc-input" accept=".lrc" style="width:100%;">
+            </div>
+            <button id="start-btn" disabled>INITIALIZE</button>
+        </div>
+    </div>
+
+    <div id="controls-bar" class="hidden-ui">
+        <button class="btn-icon" id="play-pause">
+            <svg id="icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+            <svg id="icon-pause" viewBox="0 0 24 24" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        </button>
+        <div class="timeline" id="timeline-track"><div id="progress-fill"></div></div>
+        <button class="btn-icon" id="reset-btn">
+            <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+        </button>
+    </div>
+
+    <audio id="audio-element" crossorigin="anonymous"></audio>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+
+        let scene, camera, renderer, font, starField;
+        let lyricData = [];
+        let wordMeshes = [];
+        let currentIdx = 0;
+        let isPlaying = false;
+        let lastInteraction = Date.now();
+        
+        // Audio Analysis variables
+        let audioCtx, analyser, dataArray, source;
+        
+        let targetCamPos = new THREE.Vector3(0, 0, 100);
+        let lookAtTarget = new THREE.Vector3(0, 0, 0);
+        let quadIdx = 0;
+        const quadrants = [{x:-18, y:12}, {x:18, y:-12}, {x:18, y:12}, {x:-18, y:-12}];
+
+        const audio = document.getElementById('audio-element');
+        const controls = document.getElementById('controls-bar');
+        const timelineTrack = document.getElementById('timeline-track');
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.004); // Reduced fog for clearer accelerator effect
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 100);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            createAccelerator();
+            scene.add(new THREE.AmbientLight(0xffffff, 1.4));
+
+            window.addEventListener('mousemove', () => {
+                lastInteraction = Date.now();
+                controls.classList.remove('hidden-ui');
+            });
+
+            timelineTrack.addEventListener('click', (e) => {
+                const rect = timelineTrack.getBoundingClientRect();
+                const pos = (e.clientX - rect.left) / rect.width;
+                audio.currentTime = pos * audio.duration;
+                currentIdx = lyricData.findIndex(l => l.time > audio.currentTime);
+                if(currentIdx === -1) currentIdx = lyricData.length;
+            });
+
+            animate();
+        }
+
+        // Detailed Particle Accelerator Logic
+        function createAccelerator() {
+            const geo = new THREE.BufferGeometry();
+            const count = 3000; 
+            const positions = new Float32Array(count * 3);
+            const scales = new Float32Array(count);
+
+            for(let i=0; i<count; i++) {
+                // Spawn particles in a tunnel shape
+                const i3 = i * 3;
+                positions[i3] = (Math.random() - 0.5) * 400;     // X
+                positions[i3+1] = (Math.random() - 0.5) * 400;   // Y
+                positions[i3+2] = (Math.random() - 0.5) * 1000;  // Z (Length of tunnel)
+                scales[i] = Math.random();
+            }
+
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('scale', new THREE.BufferAttribute(scales, 1));
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(32,32,0, 32,32,32);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.2, 'rgba(200,220,255,0.8)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad; ctx.fillRect(0,0,64,64);
+            const texture = new THREE.CanvasTexture(canvas);
+
+            const mat = new THREE.PointsMaterial({
+                size: 1.2, 
+                map: texture, 
+                transparent: true, 
+                opacity: 0.8, 
+                blending: THREE.AdditiveBlending, 
+                depthWrite: false
+            });
+
+            starField = new THREE.Points(geo, mat);
+            scene.add(starField);
+        }
+
+        function setupAudioAnalysis() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            source = audioCtx.createMediaElementSource(audio);
+            source.connect(analyser);
+            analyser.connect(audioCtx.destination);
+            analyser.fftSize = 256;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+        }
+
+        function spawnLyric(fullText) {
+            if(!font) return;
+            const words = fullText.split(' ');
+            const fontSize = window.innerWidth < 600 ? 1.6 : 2.8;
+            const group = new THREE.Group();
+            
+            let currentX = 0;
+            const spacing = fontSize * 0.4;
+
+            words.forEach((word, i) => {
+                const geo = new TextGeometry(word, { font: font, size: fontSize, height: 0.05 });
+                const mat = new THREE.MeshLambertMaterial({ 
+                    color: 0xffffff, 
+                    transparent: true, 
+                    opacity: 0,
+                    emissive: 0xffffff, 
+                    emissiveIntensity: 0.5 
+                });
+
+                const mesh = new THREE.Mesh(geo, mat);
+                geo.computeBoundingBox();
+                const wordWidth = geo.boundingBox.max.x - geo.boundingBox.min.x;
+                mesh.position.x = currentX;
+                currentX += wordWidth + spacing;
+                group.add(mesh);
+
+                setTimeout(() => {
+                    let op = 0;
+                    const interval = setInterval(() => {
+                        op += 0.015; 
+                        mesh.material.opacity = op;
+                        mesh.position.y = Math.sin(op * Math.PI) * 0.15;
+                        if(op >= 1) {
+                            mesh.material.opacity = 1;
+                            mesh.position.y = 0;
+                            clearInterval(interval);
+                        }
+                    }, 16);
+                }, i * 220);
+            });
+
+            const totalWidth = currentX - spacing;
+            group.children.forEach(child => child.position.x -= totalWidth / 2);
+
+            const pos = quadrants[quadIdx % quadrants.length];
+            const zPos = currentIdx * -45;
+            group.position.set(pos.x, pos.y, zPos);
+            quadIdx++;
+
+            scene.add(group);
+            wordMeshes.push(group);
+
+            if (wordMeshes.length > 1) {
+                const prev = wordMeshes[wordMeshes.length - 2];
+                const lineGeo = new THREE.BufferGeometry().setFromPoints([prev.position, group.position]);
+                const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.15 }));
+                scene.add(line);
+            }
+
+            targetCamPos.set(group.position.x * 0.5, group.position.y * 0.5, group.position.z + 70);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            camera.position.lerp(targetCamPos, 0.035);
+            
+            if(wordMeshes.length > 0) {
+                const currentMeshPos = wordMeshes[wordMeshes.length-1].position;
+                lookAtTarget.lerp(currentMeshPos, 0.035);
+                camera.lookAt(lookAtTarget);
+            }
+
+            // --- PARTICLE ACCELERATOR LOGIC ---
+            if(starField) {
+                let speedBase = 0.5;
+                let sizePulse = 1.0;
+
+                if (isPlaying && analyser) {
+                    analyser.getByteFrequencyData(dataArray);
+                    // Get average frequency (volume)
+                    let sum = 0;
+                    for(let i=0; i<dataArray.length; i++) sum += dataArray[i];
+                    let avg = sum / dataArray.length;
+                    
+                    speedBase = 0.5 + (avg / 20); // Faster based on beat
+                    sizePulse = 1.0 + (avg / 100); // Glow brighter based on beat
+                    starField.material.size = 1.2 * sizePulse;
+                }
+
+                const positions = starField.geometry.attributes.position.array;
+                for(let i=0; i<positions.length; i+=3) {
+                    // Move particles towards camera on Z axis
+                    positions[i+2] += speedBase; 
+                    
+                    // If particle passes camera, reset to far distance
+                    if(positions[i+2] > camera.position.z) {
+                        positions[i+2] = camera.position.z - 1000;
+                    }
+                }
+                starField.geometry.attributes.position.needsUpdate = true;
+                starField.rotation.z += 0.001; // Slow vortex rotation
+            }
+
+            if (isPlaying) {
+                const time = audio.currentTime;
+                document.getElementById('progress-fill').style.width = (time / audio.duration * 100) + "%";
+                if (currentIdx < lyricData.length && time >= lyricData[currentIdx].time) {
+                    spawnLyric(lyricData[currentIdx].text);
+                    currentIdx++;
+                }
+                if (Date.now() - lastInteraction > 2500) controls.classList.add('hidden-ui');
+            }
+            renderer.render(scene, camera);
+        }
+
+        const loader = new FontLoader();
+        loader.load('https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json', (f) => {
+            font = f; document.getElementById('start-btn').disabled = false;
+        });
+
+        document.getElementById('start-btn').onclick = () => {
+            const aFile = document.getElementById('audio-input').files[0];
+            const lFile = document.getElementById('lrc-input').files[0];
+            if(!aFile || !lFile) return;
+            audio.src = URL.createObjectURL(aFile);
+            
+            setupAudioAnalysis(); // Start the beat listener
+
+            const reader = new FileReader();
+            reader.onload = (e) => { lyricData = parseLRC(e.target.result); start(); };
+            reader.readAsText(lFile);
+        };
+
+        function start() {
+            document.getElementById('setup-overlay').style.opacity = 0;
+            setTimeout(() => document.getElementById('setup-overlay').style.display = 'none', 1000);
+            if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+            audio.play(); isPlaying = true;
+            document.getElementById('icon-play').style.display = 'none';
+            document.getElementById('icon-pause').style.display = 'block';
+        }
+
+        function parseLRC(lrc) {
+            return lrc.split('\n').map(line => {
+                const m = /\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\]/.exec(line);
+                if (m) {
+                    const time = parseInt(m[1])*60 + parseInt(m[2]) + (m[3] ? parseInt(m[3])/100 : 0);
+                    return { time, text: line.replace(/\[.*\]/, '').trim() };
+                }
+                return null;
+            }).filter(x => x && x.text);
+        }
+
+        document.getElementById('play-pause').onclick = () => {
+            if (audio.paused) { 
+                if(audioCtx) audioCtx.resume();
+                audio.play(); isPlaying = true;
+                document.getElementById('icon-play').style.display = 'none';
+                document.getElementById('icon-pause').style.display = 'block';
+            } else { 
+                audio.pause(); isPlaying = false;
+                document.getElementById('icon-play').style.display = 'block';
+                document.getElementById('icon-pause').style.display = 'none';
+            }
+        };
+
+        document.getElementById('reset-btn').onclick = () => location.reload();
+        init();
+    </script>
+</body>
+</html>
